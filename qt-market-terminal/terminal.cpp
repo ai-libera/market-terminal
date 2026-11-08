@@ -75,6 +75,11 @@
 // (last entry) every ticker with a sector profile.
 // The selection is persisted in the settings.
 #define HEATMAP_CLUSTERS
+// Fear & Greed indicator moves from the status bar to the command bar (right
+// of LIGHT). Clicking it opens a breakdown: the 7 CNN components, their equal
+// weights and contributions, and the average that yields the headline score.
+// Requires EXTRA_DATA_PANELS.
+#define FNG_TOP_BUTTON
 
 #include <QApplication>
 #include <QMainWindow>
@@ -1732,6 +1737,56 @@ static QColor fngColor(double score) {
   if (score > FNG_GREED_MIN) return COL_UP;
   return COL_HOLD;
 }
+
+#ifdef FNG_TOP_BUTTON
+static const char *FNG_BTN_PREFIX = "F&&G";  // "&&": no mnemonic
+static const char *FNG_BTN_TIP_SUFFIX = "\nClick: how the score is built";
+static const char *FNG_DLG_TITLE = "CNN Fear & Greed: score breakdown";
+static const int FNG_DLG_W = 900;
+static const int FNG_DLG_H = 520;
+static const int FNG_SCORE_DECIMALS = 1;
+static const double FNG_MATCH_TOL = 1.0;  // rounded components vs headline
+
+// CNN's rating bands (upper bound inclusive).
+struct FngBand {
+  double hi;
+  const char *name;
+};
+static const FngBand FNG_BANDS[] = {{24, "extreme fear"},
+                                    {44, "fear"},
+                                    {55, "neutral"},
+                                    {75, "greed"},
+                                    {100, "extreme greed"}};
+
+static QString fngBandName(double score) {
+  const double r = std::round(score);
+  for (const FngBand &b : FNG_BANDS)
+    if (r <= b.hi) return QString::fromLatin1(b.name);
+  return QString::fromLatin1(FNG_BANDS[COUNT_OF(FNG_BANDS) - 1].name);
+}
+
+// What CNN measures for each component (names as sent by the backend).
+struct FngMeaning {
+  const char *name;
+  const char *what;
+};
+static const FngMeaning FNG_MEANINGS[] = {
+    {"Market Momentum", "S&P 500 vs. its 125-day moving average"},
+    {"Stock Price Strength", "NYSE stocks at 52-week highs vs. 52-week lows"},
+    {"Stock Price Breadth",
+     "McClellan Volume Summation Index (advancing vs. declining volume)"},
+    {"Put/Call Options", "5-day average put/call ratio (high = fear)"},
+    {"Market Volatility", "VIX vs. its 50-day moving average (high = fear)"},
+    {"Safe Haven Demand", "20-day return of stocks vs. Treasury bonds"},
+    {"Junk Bond Demand", "Junk vs. investment-grade bond yield spread"}};
+
+static QString fngMeaning(const QString &name) {
+  for (const FngMeaning &m : FNG_MEANINGS)
+    if (name.compare(QLatin1String(m.name), Qt::CaseInsensitive) == 0)
+      return QString::fromUtf8(m.what);
+  return QString();
+}
+#endif
 
 static QColor sentimentColor(const QString &s) {
   const QString l = s.toLower();
@@ -3798,7 +3853,7 @@ private:
     m_connLabel = new QLabel;
     m_updLabel = new QLabel;
     statusBar()->addWidget(m_connLabel, 1);
-#ifdef EXTRA_DATA_PANELS
+#if defined(EXTRA_DATA_PANELS) && !defined(FNG_TOP_BUTTON)
     m_fngLabel = new QLabel;
     m_fngLabel->setToolTip("CNN Fear & Greed index (SOC page for details)");
     statusBar()->addPermanentWidget(m_fngLabel);
@@ -3896,6 +3951,14 @@ private:
     QShortcut *themeKey = new QShortcut(QKeySequence(THEME_SHORTCUT), this);
     QObject::connect(themeKey, &QShortcut::activated, this,
                      [this]() { m_themeBtn->toggle(); });
+#endif
+
+#if defined(EXTRA_DATA_PANELS) && defined(FNG_TOP_BUTTON)
+    m_fngBtn = new QPushButton(QString(FNG_BTN_PREFIX) + " " + NOT_AVAILABLE);
+    m_fngBtn->setToolTip(QString("CNN Fear & Greed index") + FNG_BTN_TIP_SUFFIX);
+    QObject::connect(m_fngBtn, &QPushButton::clicked, this,
+                     [this]() { openFngDialog(); });
+    h->addWidget(m_fngBtn);
 #endif
 
     h->addStretch(1);
@@ -6684,9 +6747,17 @@ private:
 
   void applyFearGreed(const QString &err, const QJsonObject &o) {
     if (!err.isEmpty()) {
+#ifdef FNG_TOP_BUTTON
+      m_fngLast = QJsonObject();
+      m_fngErr = err;
+      setFngButton(QString(FNG_BTN_PREFIX) + " " + NOT_AVAILABLE, COL_DIM,
+                   err + FNG_BTN_TIP_SUFFIX);
+      refreshFngDialog();
+#else
       m_fngLabel->setText("F&G " + QString(NOT_AVAILABLE));
       setLabelColor(m_fngLabel, COL_DIM);
       m_fngLabel->setToolTip(err);
+#endif
       setPanelError(m_fngPanel.status, err);
       m_fngScore->setText(NOT_AVAILABLE);
       setLabelColor(m_fngScore, COL_DIM);
@@ -6700,8 +6771,10 @@ private:
                               ? jstr(o, "rating").toUpper().replace('_', ' ')
                               : jstr(o, "label").toUpper();
     const QColor c = hs ? fngColor(score) : COL_DIM;
+#ifndef FNG_TOP_BUTTON
     m_fngLabel->setText(QString("F&G %1 %2").arg(orNA(hs, fmtNum(score, 0)), label));
     setLabelColor(m_fngLabel, c);
+#endif
     m_fngScore->setText(orNA(hs, fmtNum(score, 0)) + "  " + label);
     setLabelColor(m_fngScore, c);
 
@@ -6748,10 +6821,237 @@ private:
     if (inds.isEmpty()) setTableMessage(m_fngTable, "No components");
     const QJsonObject prov = o.value("provenance").toObject();
     setProvenance(m_fngPanel.status, prov);
-    m_fngLabel->setToolTip("CNN Fear & Greed  " +
-                           prov.value("quality").toString() + "  " +
-                           fmtWhen(jstr(o, "timestamp")));
+    const QString tip = "CNN Fear & Greed  " + prov.value("quality").toString() +
+                        "  " + fmtWhen(jstr(o, "timestamp"));
+#ifdef FNG_TOP_BUTTON
+    m_fngLast = o;
+    m_fngErr.clear();
+    setFngButton(QString("%1 %2 %3")
+                     .arg(QString(FNG_BTN_PREFIX), orNA(hs, fmtNum(score, 0)),
+                          label),
+                 c, tip + FNG_BTN_TIP_SUFFIX);
+    refreshFngDialog();
+#else
+    m_fngLabel->setToolTip(tip);
+#endif
   }
+
+#ifdef FNG_TOP_BUTTON
+  void setFngButton(const QString &text, const QColor &c, const QString &tip) {
+    m_fngBtn->setText(text);
+    m_fngBtn->setStyleSheet(QString("QPushButton { color: %1; font-weight: bold; }")
+                                .arg(c.name()));
+    m_fngBtn->setToolTip(tip);
+  }
+
+  // Modeless breakdown window; refreshed whenever new data arrives.
+  void openFngDialog() {
+    if (m_fngDlg) {
+      m_fngDlg->raise();
+      m_fngDlg->activateWindow();
+      return;
+    }
+    QDialog *d = new QDialog(this);
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    d->setWindowTitle(FNG_DLG_TITLE);
+    d->resize(FNG_DLG_W, FNG_DLG_H);
+    QVBoxLayout *v = new QVBoxLayout(d);
+    v->setContentsMargins(PANEL_PAD, PANEL_PAD, PANEL_PAD, PANEL_PAD);
+    v->setSpacing(PANEL_SPACING);
+
+    QHBoxLayout *bar = new QHBoxLayout;
+    m_fngDlgScore = new QLabel;
+    QFont sf = font();
+    sf.setPointSize(HEADER_PRICE_PT);
+    sf.setBold(true);
+    m_fngDlgScore->setFont(sf);
+    bar->addWidget(m_fngDlgScore, 1);
+    QPushButton *refresh = new QPushButton("REFRESH");
+    refresh->setToolTip("Fetch the index again");
+    QObject::connect(refresh, &QPushButton::clicked, d,
+                     [this]() { fetchFearGreed(); });
+    bar->addWidget(refresh);
+    QPushButton *close = new QPushButton("CLOSE");
+    QObject::connect(close, &QPushButton::clicked, d, &QDialog::close);
+    bar->addWidget(close);
+    v->addLayout(bar);
+
+    m_fngDlgInfo = makeInfoLabel();
+    v->addWidget(m_fngDlgInfo);
+    static const ColSpec COLS[] = {{"INDICATOR", 160, false},
+                                   {"SCORE", 60, true},
+                                   {"RATING", 100, false},
+                                   {"WEIGHT", 64, true},
+                                   {"ADDS", 60, true},
+                                   {"VS SCORE", 76, true},
+                                   {"WHAT CNN MEASURES", 0, false}};
+    m_fngDlgTable = makeColTable(COLS, COUNT_OF(COLS));
+    m_fngDlgTable->setToolTip(
+        "ADDS = score x weight (its share of the headline); "
+        "VS SCORE = component minus the average (+ pulls up, - drags down)");
+    v->addWidget(m_fngDlgTable, 1);
+    m_fngDlgCalc = makeInfoLabel();
+    m_fngDlgCalc->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    v->addWidget(m_fngDlgCalc);
+
+    m_fngDlg = d;
+    refreshFngDialog();
+    d->show();
+  }
+
+  void refreshFngDialog() {
+    if (!m_fngDlg) return;
+    if (m_fngLast.isEmpty()) {
+      m_fngDlgScore->setText(QString("F&G ") + NOT_AVAILABLE);
+      setLabelColor(m_fngDlgScore, COL_DIM);
+      m_fngDlgInfo->clear();
+      m_fngDlgCalc->clear();
+      setTableMessage(m_fngDlgTable, m_fngErr.isEmpty()
+                                         ? QString(LOADING_TEXT)
+                                         : "Unavailable: " + elide(m_fngErr));
+      return;
+    }
+    const QJsonObject &o = m_fngLast;
+    double score = 0;
+    const bool hs = jnum(o.value("score"), score);
+    const QString label = jstr(o, "label").isEmpty()
+                              ? jstr(o, "rating").toUpper().replace('_', ' ')
+                              : jstr(o, "label").toUpper();
+    m_fngDlgScore->setText(QString("F&G  %1  %2")
+                               .arg(orNA(hs, fmtNum(score, 0)), label));
+    setLabelColor(m_fngDlgScore, hs ? fngColor(score) : COL_DIM);
+
+    // Header: source / time, history, rating bands.
+    const QJsonObject prov = o.value("provenance").toObject();
+    QStringList info;
+    info << span(COL_DIM, "SOURCE") + " CNN Business (production.dataviz.cnn.io)" +
+                "&nbsp;&nbsp;" + span(COL_DIM, "AS OF") + " " +
+                fmtWhen(jstr(o, "timestamp")).toHtmlEscaped() + "&nbsp;&nbsp;" +
+                span(COL_DIM, prov.value("quality").toString());
+    struct Prev {
+      const char *key;
+      const char *label;
+    };
+    static const Prev PREVS[] = {{"previousClose", "PREV CLOSE"},
+                                 {"previousWeek", "1W AGO"},
+                                 {"previousMonth", "1M AGO"},
+                                 {"previousYear", "1Y AGO"}};
+    QStringList prevs;
+    for (const Prev &p : PREVS) {
+      double pv = 0;
+      if (!jnum(o.value(p.key), pv)) continue;
+      QString s = span(COL_DIM, p.label) + " " + span(fngColor(pv), fmtNum(pv, 0));
+      if (hs) {
+        const double dlt = score - pv;
+        s += " " + span(COL_DIM, "(" + (dlt > 0 ? QString("+") : QString()) +
+                                     fmtNum(dlt, 0) + ")");
+      }
+      prevs << s;
+    }
+    if (!prevs.isEmpty()) info << prevs.join("&nbsp;&nbsp;&nbsp;");
+    QStringList bands;
+    double lo = 0;
+    for (const FngBand &b : FNG_BANDS) {
+      const double mid = (lo + b.hi) / 2.0;
+      bands << span(fngColor(mid), QString("%1\xe2\x80\x93%2 %3")
+                                       .arg(fmtNum(lo, 0), fmtNum(b.hi, 0),
+                                            QString(b.name).toUpper()));
+      lo = b.hi + 1;
+    }
+    info << span(COL_DIM, "SCALE") + " " + bands.join("&nbsp;&nbsp;");
+    m_fngDlgInfo->setText(info.join("<br>"));
+
+    // Components: CNN's headline is the equal-weighted mean of the scores.
+    const QJsonArray inds = o.value("indicators").toArray();
+    int n = 0;
+    double sum = 0;
+    QStringList terms;
+    QString lowName, highName;
+    double lowV = 0, highV = 0;
+    for (const QJsonValue &iv : inds) {
+      const QJsonObject x = iv.toObject();
+      double v = 0;
+      if (!jnum(x.value("score"), v)) continue;
+      if (n == 0 || v < lowV) { lowV = v; lowName = jstr(x, "name"); }
+      if (n == 0 || v > highV) { highV = v; highName = jstr(x, "name"); }
+      ++n;
+      sum += v;
+      terms << fmtNum(v, 0);
+    }
+    const double avg = n > 0 ? sum / n : 0;
+
+    beginRows(m_fngDlgTable, inds.size() + 1);
+    for (int r = 0; r < inds.size(); ++r) {
+      const QJsonObject x = inds[r].toObject();
+      double v = 0;
+      const bool hv = jnum(x.value("score"), v);
+      const QString name = jstr(x, "name");
+      const QString rating = jstr(x, "rating").replace('_', ' ');
+      setCell(m_fngDlgTable, r, 0, name);
+      setCell(m_fngDlgTable, r, 1, orNA(hv, fmtNum(v, 0)),
+              hv ? fngColor(v) : COL_DIM, ALIGN_NUM);
+      setCell(m_fngDlgTable, r, 2, rating, sentimentColor(rating));
+      setCell(m_fngDlgTable, r, 3,
+              hv ? QString("1/%1").arg(n) : QString(NOT_AVAILABLE), COL_DIM,
+              ALIGN_NUM);
+      setCell(m_fngDlgTable, r, 4,
+              orNA(hv, fmtNum(v / n, FNG_SCORE_DECIMALS)), COL_TEXT, ALIGN_NUM);
+      const double dv = v - avg;
+      setCell(m_fngDlgTable, r, 5,
+              orNA(hv, (dv > 0 ? QString("+") : QString()) +
+                           fmtNum(dv, FNG_SCORE_DECIMALS)),
+              hv ? (dv >= 0 ? COL_UP : COL_DOWN) : COL_DIM, ALIGN_NUM);
+      setCell(m_fngDlgTable, r, 6, fngMeaning(name), COL_DIM)
+          ->setToolTip(fngMeaning(name));
+    }
+    const int tr = inds.size();
+    const bool hasAvg = n > 0;
+    setCell(m_fngDlgTable, tr, 0, "AVERAGE", COL_AMBER);
+    setCell(m_fngDlgTable, tr, 1,
+            orNA(hasAvg, fmtNum(avg, FNG_SCORE_DECIMALS)),
+            hasAvg ? fngColor(avg) : COL_DIM, ALIGN_NUM);
+    setCell(m_fngDlgTable, tr, 2, hasAvg ? fngBandName(avg) : QString(),
+            hasAvg ? fngColor(avg) : COL_DIM);
+    setCell(m_fngDlgTable, tr, 3, hasAvg ? QString("%1/%1").arg(n) : QString(),
+            COL_DIM, ALIGN_NUM);
+    setCell(m_fngDlgTable, tr, 4, orNA(hasAvg, fmtNum(avg, FNG_SCORE_DECIMALS)),
+            COL_AMBER, ALIGN_NUM);
+    setCell(m_fngDlgTable, tr, 5, QString());
+    setCell(m_fngDlgTable, tr, 6, "Equal-weighted mean of the components", COL_DIM);
+    if (inds.isEmpty()) setTableMessage(m_fngDlgTable, "No components");
+
+    // Calculation and cross-check against CNN's headline.
+    QStringList calc;
+    if (hasAvg) {
+      calc << span(COL_DIM, "CALC") + " (" + terms.join(" + ") + ") / " +
+                  QString::number(n) + " = " + fmtNum(sum, 0) + " / " +
+                  QString::number(n) + " = " +
+                  "<b>" + span(fngColor(avg), fmtNum(avg, FNG_SCORE_DECIMALS)) +
+                  "</b>";
+      if (hs) {
+        const double diff = avg - score;
+        const bool match = std::fabs(diff) < FNG_MATCH_TOL;
+        calc << span(COL_DIM, "CHECK") + " CNN headline " +
+                    span(fngColor(score), fmtNum(score, 0)) + ": " +
+                    (match ? span(COL_UP, "matches the component average")
+                           : span(COL_WARN,
+                                  QString("differs by %1 (CNN may lag a "
+                                          "component update)")
+                                      .arg(fmtNum(diff, FNG_SCORE_DECIMALS))));
+      }
+      calc << span(COL_DIM, "DRIVERS") + " lowest " + lowName.toHtmlEscaped() +
+                  " " + span(fngColor(lowV), fmtNum(lowV, 0)) + ", highest " +
+                  highName.toHtmlEscaped() + " " +
+                  span(fngColor(highV), fmtNum(highV, 0));
+    }
+    calc << span(COL_DIM,
+                 "Each component is CNN's 0\xe2\x80\x93" "100 reading of its indicator "
+                 "relative to its own recent history (50 = normal). Component "
+                 "scores are rounded, so the average can differ from the "
+                 "headline by less than 1.");
+    m_fngDlgCalc->setText(calc.join("<br>"));
+  }
+#endif
 
   void fetchWsb() {
     QUrlQuery q;
@@ -7222,6 +7522,16 @@ private:
   QTimer *m_fngTimer = nullptr;
   QTimer *m_searchTimer = nullptr;
   QLabel *m_fngLabel = nullptr;  // status bar Fear & Greed
+#ifdef FNG_TOP_BUTTON
+  QPushButton *m_fngBtn = nullptr;  // command bar Fear & Greed
+  QJsonObject m_fngLast;            // last good payload (breakdown dialog)
+  QString m_fngErr;                 // last error ("" when m_fngLast is valid)
+  QPointer<QDialog> m_fngDlg;
+  QLabel *m_fngDlgScore = nullptr;  // children of m_fngDlg
+  QLabel *m_fngDlgInfo = nullptr;
+  QLabel *m_fngDlgCalc = nullptr;
+  QTableWidget *m_fngDlgTable = nullptr;
+#endif
   QStringListModel *m_searchModel = nullptr;
   QCompleter *m_completer = nullptr;
   int m_searchSeq = 0;
