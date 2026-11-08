@@ -61,6 +61,20 @@
 // GET /api/v2/quote-batch (100 per call). Wheel / pinch zooms, drag (or a
 // two-finger trackpad scroll) pans, double-click opens the ticker.
 #define HEATMAP
+// Heatmap: double-click a sector / industry-group header to zoom that box to
+// fit the view; double-click it again (or Esc) to fit the whole map again.
+#define HEATMAP_SECTION_ZOOM
+// Heatmap: header zoom, Esc and FIT glide to the new view (eased zoom about
+// a fixed point) instead of jumping. Requires HEATMAP_SECTION_ZOOM.
+#define HEATMAP_ZOOM_ANIMATION
+// Heatmap: a cluster drop-down in the heatmap bar. Besides the S&P 500 it maps
+// industry clusters (semis & hardware, software & internet, biotech, banks,
+// oil & gas, ...) of every US-listed company above $1B from the backend's
+// ticker universe (GET /api/v2/universe?index=all, Yahoo industries), boxed
+// by industry -> market-cap band, plus all mega caps, non-US companies and
+// (last entry) every ticker with a sector profile.
+// The selection is persisted in the settings.
+#define HEATMAP_CLUSTERS
 
 #include <QApplication>
 #include <QMainWindow>
@@ -101,6 +115,13 @@
 #include <QtGui/QCursor>
 #include <algorithm>
 #include <limits>
+#endif
+#ifdef HEATMAP_ZOOM_ANIMATION
+#include <QtCore/QElapsedTimer>
+#endif
+#ifdef HEATMAP_CLUSTERS
+#include <QtCore/QElapsedTimer>
+#include <QtCore/QSignalBlocker>
 #endif
 
 #include <QtGui/QPainter>
@@ -209,6 +230,15 @@ static const int HM_REFRESH_MS = 60000;         // quote refresh while shown
 static const double HM_ZOOM_MAX = 40.0;
 static const double HM_WHEEL_ZOOM_BASE = 1.0015;  // per 1/8 degree of wheel
 static const double HM_KEY_ZOOM = 1.25;           // +/- keys
+#ifdef HEATMAP_SECTION_ZOOM
+static const double HM_ZOOM_EPS = 1e-6;  // scale above 1 + eps counts as zoomed
+#endif
+#ifdef HEATMAP_ZOOM_ANIMATION
+static const int HM_ZOOM_ANIM_MS = 320;          // duration of a zoom transition
+static const int HM_ZOOM_ANIM_TICK_MS = 16;      // ~60 fps
+static const double HM_ZOOM_ANIM_MIN_DS = 1e-3;  // below: pan instead of zoom
+static const double HM_ZOOM_ANIM_MIN_PX = 0.5;   // smaller moves: no animation
+#endif
 static const int HM_DRAG_THRESHOLD_PX = 4;
 static const double HM_COLOR_RANGE_PCT = 3.0;     // full red / green at +-3%
 static const double HM_MIN_WEIGHT_FRAC = 0.002;   // smallest tile vs largest
@@ -244,6 +274,22 @@ static const QColor HM_UP(46, 156, 94);
 static const QColor HM_DOWN(222, 82, 82);
 static const QColor HM_NODATA(44, 44, 50);
 static const QColor HM_TILE_TEXT(244, 244, 244);
+#ifdef HEATMAP_CLUSTERS
+static const char *HM_CLUSTER_TITLE = "HMAP  HEATMAP";
+static const char *SETTINGS_HEATMAP_CLUSTER_KEY = "heatmapCluster";
+static const int HM_ALL_UNIVERSE_LIMIT = 50000;      // backend universeLimitMax
+static const int HM_CLUSTER_MAX_TILES = 400;         // largest by market cap
+static const int HM_UNIVERSE_CACHE_MS = 30 * 60 * 1000;  // then re-fetch
+static const double HM_BILLION = 1e9;
+static const double HM_CLUSTER_MIN_CAP = 1.0 * HM_BILLION;
+static const double HM_GIANTS_MIN_CAP = 50.0 * HM_BILLION;
+static const double HM_MEGA_CAP_MIN = 200.0 * HM_BILLION;
+static const double HM_LARGE_CAP_MIN = 10.0 * HM_BILLION;
+static const double HM_MID_CAP_MIN = 2.0 * HM_BILLION;
+static const char *HM_HOME_COUNTRY = "United States";
+static const char *HM_EQUITY_TYPE = "EQUITY";
+static const char *HM_OTC_MARK = "OTC";  // EDGAR exchange of OTC listings
+#endif
 #endif
 
 // Quality markers emitted by the collectors.
@@ -2232,6 +2278,258 @@ struct HmSector {
   QRectF r, hdr;
 };
 
+#ifdef HEATMAP_CLUSTERS
+// Heatmap clusters: which companies the map shows and how they are boxed.
+// Industry clusters are sets of Yahoo industries (see yahoo/profiles.json),
+// sized so that each holds roughly 50..300 US-listed companies above
+// HM_CLUSTER_MIN_CAP.
+enum HmClusterKind {
+  HmClusterSp500,     // S&P 500 members: sector -> industry group
+  HmClusterGiants,    // every listed company >= minCap: sector -> group
+  HmClusterIndustry,  // the cluster's industries: industry -> cap band
+  HmClusterForeign,   // non-US companies: country -> sector
+  HmClusterAll,       // every classified equity: sector -> group, no limits
+};
+
+struct HmCluster {
+  const char *key;    // settings id
+  const char *label;  // drop-down text
+  HmClusterKind kind;
+  double minCap;
+  const char *const *industries;  // nullptr-terminated (HmClusterIndustry)
+  const char *desc;               // tooltip (else the industry list)
+};
+
+static const char *const HM_C_SEMIS[] = {
+    "Semiconductors", "Semiconductor Equipment & Materials", "Consumer Electronics",
+    "Computer Hardware", "Communication Equipment", "Electronic Components",
+    "Scientific & Technical Instruments", "Electronics & Computer Distribution",
+    nullptr};
+static const char *const HM_C_SOFT[] = {
+    "Software - Infrastructure", "Software - Application",
+    "Information Technology Services", "Internet Content & Information",
+    "Electronic Gaming & Multimedia", nullptr};
+static const char *const HM_C_BIO[] = {
+    "Biotechnology", "Drug Manufacturers - General",
+    "Drug Manufacturers - Specialty & Generic", nullptr};
+static const char *const HM_C_MEDTECH[] = {
+    "Medical Devices", "Medical Instruments & Supplies", "Diagnostics & Research",
+    "Healthcare Plans", "Medical Care Facilities", "Medical Distribution",
+    "Health Information Services", "Pharmaceutical Retailers", nullptr};
+static const char *const HM_C_BANKS[] = {
+    "Banks - Diversified", "Banks - Regional", "Credit Services",
+    "Mortgage Finance", nullptr};
+static const char *const HM_C_MARKETS[] = {
+    "Capital Markets", "Asset Management", "Financial Data & Stock Exchanges",
+    "Financial Conglomerates", nullptr};
+static const char *const HM_C_INSURANCE[] = {
+    "Insurance - Diversified", "Insurance - Property & Casualty",
+    "Insurance - Life", "Insurance - Specialty", "Insurance - Reinsurance",
+    "Insurance Brokers", nullptr};
+static const char *const HM_C_OIL[] = {
+    "Oil & Gas Integrated", "Oil & Gas E&P", "Oil & Gas Midstream",
+    "Oil & Gas Refining & Marketing", "Oil & Gas Equipment & Services",
+    "Oil & Gas Drilling", "Thermal Coal", nullptr};
+static const char *const HM_C_POWER[] = {
+    "Utilities - Regulated Electric", "Utilities - Independent Power Producers",
+    "Utilities - Renewable", "Utilities - Diversified", "Utilities - Regulated Gas",
+    "Utilities - Regulated Water", "Uranium", "Solar", nullptr};
+static const char *const HM_C_METALS[] = {
+    "Gold", "Silver", "Copper", "Other Industrial Metals & Mining",
+    "Other Precious Metals & Mining", "Steel", "Aluminum", "Coking Coal", nullptr};
+static const char *const HM_C_CHEM[] = {
+    "Specialty Chemicals", "Chemicals", "Agricultural Inputs",
+    "Packaging & Containers", "Paper & Paper Products", nullptr};
+static const char *const HM_C_AERO[] = {"Aerospace & Defense", nullptr};
+static const char *const HM_C_MACHINERY[] = {
+    "Specialty Industrial Machinery", "Electrical Equipment & Parts",
+    "Farm & Heavy Construction Machinery", "Conglomerates", "Tools & Accessories",
+    "Metal Fabrication", "Pollution & Treatment Controls", nullptr};
+static const char *const HM_C_BUILD[] = {
+    "Residential Construction", "Building Products & Equipment",
+    "Building Materials", "Engineering & Construction", "Home Improvement Retail",
+    "Furnishings, Fixtures & Appliances", "Lumber & Wood Production", nullptr};
+static const char *const HM_C_TRANSPORT[] = {
+    "Railroads", "Integrated Freight & Logistics", "Trucking", "Marine Shipping",
+    "Airlines", "Airports & Air Services", "Rental & Leasing Services", nullptr};
+static const char *const HM_C_BIZSVC[] = {
+    "Specialty Business Services", "Industrial Distribution", "Waste Management",
+    "Consulting Services", "Security & Protection Services",
+    "Staffing & Employment Services", "Business Equipment & Supplies",
+    "Infrastructure Operations", nullptr};
+static const char *const HM_C_RETAIL[] = {
+    "Internet Retail", "Discount Stores", "Home Improvement Retail",
+    "Apparel Retail", "Specialty Retail", "Department Stores", "Grocery Stores",
+    nullptr};
+static const char *const HM_C_AUTOS[] = {
+    "Auto Manufacturers", "Auto Parts", "Auto & Truck Dealerships",
+    "Recreational Vehicles", nullptr};
+static const char *const HM_C_TRAVEL[] = {
+    "Restaurants", "Travel Services", "Lodging", "Resorts & Casinos", "Gambling",
+    "Leisure", "Personal Services", nullptr};
+static const char *const HM_C_APPAREL[] = {
+    "Apparel Manufacturing", "Footwear & Accessories", "Luxury Goods",
+    "Textile Manufacturing", "Apparel Retail", nullptr};
+static const char *const HM_C_STAPLES[] = {
+    "Beverages - Non-Alcoholic", "Beverages - Brewers",
+    "Beverages - Wineries & Distilleries", "Packaged Foods", "Confectioners",
+    "Tobacco", "Household & Personal Products", "Farm Products",
+    "Food Distribution", "Education & Training Services", nullptr};
+static const char *const HM_C_MEDIA[] = {
+    "Telecom Services", "Entertainment", "Advertising Agencies", "Publishing",
+    "Broadcasting", nullptr};
+static const char *const HM_C_REIT[] = {
+    "REIT - Specialty", "REIT - Healthcare Facilities", "REIT - Industrial",
+    "REIT - Retail", "REIT - Residential", "REIT - Diversified", "REIT - Office",
+    "REIT - Mortgage", "REIT - Hotel & Motel", "Real Estate Services",
+    "Real Estate - Development", "Real Estate - Diversified", nullptr};
+
+static const HmCluster HM_CLUSTERS[] = {
+    {"sp500", "S&P 500", HmClusterSp500, 0.0, nullptr,
+     "S&P 500 members: sector -> industry group"},
+    {"giants", "MEGA CAPS", HmClusterGiants, HM_GIANTS_MIN_CAP, nullptr,
+     "Every US-listed company (ADRs included) above $%1B: sector -> industry group"},
+    {"semis", "SEMIS & HARDWARE", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_SEMIS, nullptr},
+    {"software", "SOFTWARE & INTERNET", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_SOFT, nullptr},
+    {"biotech", "BIOTECH & PHARMA", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_BIO, nullptr},
+    {"medtech", "MEDTECH & HEALTH SERVICES", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_MEDTECH, nullptr},
+    {"banks", "BANKS & LENDERS", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_BANKS, nullptr},
+    {"markets", "MARKETS & ASSET MGMT", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_MARKETS, nullptr},
+    {"insurance", "INSURANCE", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_INSURANCE, nullptr},
+    {"oil", "OIL & GAS", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_OIL, nullptr},
+    {"power", "POWER & CLEAN ENERGY", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_POWER, nullptr},
+    {"metals", "METALS & MINING", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_METALS, nullptr},
+    {"chemicals", "CHEMICALS & MATERIALS", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_CHEM, nullptr},
+    {"aero", "AEROSPACE & DEFENSE", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_AERO, nullptr},
+    {"machinery", "MACHINERY & ELECTRIFICATION", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_MACHINERY, nullptr},
+    {"build", "HOMEBUILDING & CONSTRUCTION", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_BUILD, nullptr},
+    {"transport", "TRANSPORT & LOGISTICS", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_TRANSPORT, nullptr},
+    {"bizsvc", "BUSINESS SERVICES", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_BIZSVC, nullptr},
+    {"retail", "RETAIL & E-COMMERCE", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_RETAIL, nullptr},
+    {"autos", "AUTOS & EV", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_AUTOS, nullptr},
+    {"travel", "TRAVEL, LEISURE & DINING", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_TRAVEL, nullptr},
+    {"apparel", "APPAREL & LUXURY", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_APPAREL, nullptr},
+    {"staples", "FOOD, BEVERAGE & STAPLES", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_STAPLES, nullptr},
+    {"media", "MEDIA & TELECOM", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_MEDIA, nullptr},
+    {"reits", "REAL ESTATE & REITS", HmClusterIndustry, HM_CLUSTER_MIN_CAP, HM_C_REIT, nullptr},
+    {"foreign", "NON-US COMPANIES (ADRs)", HmClusterForeign, HM_CLUSTER_MIN_CAP, nullptr,
+     "US-listed companies headquartered outside the US above $%1B: country -> sector"},
+    {"all", "ALL TICKERS", HmClusterAll, 0.0, nullptr,
+     "Every ticker with a sector profile (OTC included, no size floor): sector -> "
+     "industry group. Thousands of tiles; quotes take a while to fill in."},
+};
+static const int HM_CLUSTER_COUNT = COUNT_OF(HM_CLUSTERS);
+static const int HM_CLUSTER_DEFAULT = 0;  // S&P 500
+
+static int hmClusterIndex(const QString &key) {
+  for (int i = 0; i < HM_CLUSTER_COUNT; ++i)
+    if (key == QLatin1String(HM_CLUSTERS[i].key)) return i;
+  return HM_CLUSTER_DEFAULT;
+}
+
+static QString hmClusterTooltip(const HmCluster &c) {
+  if (c.desc) {
+    const QString d = QString::fromLatin1(c.desc);
+    return d.contains(QLatin1String("%1")) ? d.arg(c.minCap / HM_BILLION) : d;
+  }
+  QStringList inds;
+  if (c.industries)
+    for (const char *const *p = c.industries; *p; ++p) inds << QString::fromLatin1(*p);
+  return QString("US-listed companies above $%1B, industry -> market-cap band:\n%2")
+      .arg(c.minCap / HM_BILLION)
+      .arg(inds.join(", "));
+}
+
+// "MEGA CAP  >$200B" .. "SMALL CAP  <$2B" (from the band thresholds).
+static QString hmCapBand(double cap) {
+  const double mega = HM_MEGA_CAP_MIN / HM_BILLION;
+  const double large = HM_LARGE_CAP_MIN / HM_BILLION;
+  const double mid = HM_MID_CAP_MIN / HM_BILLION;
+  if (cap >= HM_MEGA_CAP_MIN) return QString("MEGA CAP  >$%1B").arg(mega);
+  if (cap >= HM_LARGE_CAP_MIN) return QString("LARGE CAP  $%1-%2B").arg(large).arg(mega);
+  if (cap >= HM_MID_CAP_MIN) return QString("MID CAP  $%1-%2B").arg(mid).arg(large);
+  return QString("SMALL CAP  <$%1B").arg(mid);
+}
+
+// Of two listings of one company (share classes, units, preferreds) the
+// plain common-stock ticker wins: no '-' / '.' suffix, then the shorter one.
+static bool hmBetterListing(const QString &a, const QString &b) {
+  const bool aPlain = !a.contains('-') && !a.contains('.');
+  const bool bPlain = !b.contains('-') && !b.contains('.');
+  if (aPlain != bPlain) return aPlain;
+  return a.size() < b.size();
+}
+
+// Tiles of a non-S&P cluster from the universe items (GET /api/v2/universe
+// ?index=all): equities off OTC with a market cap >= c.minCap, one listing
+// per company (CIK), at most HM_CLUSTER_MAX_TILES (largest first).
+static QVector<HmTile> hmClusterTiles(const QJsonArray &items, const HmCluster &c) {
+  QSet<QString> inds;
+  if (c.industries)
+    for (const char *const *p = c.industries; *p; ++p)
+      inds.insert(QString::fromLatin1(*p).toLower());
+  QVector<HmTile> tiles;
+  QHash<QString, int> byCompany;  // CIK (else name) -> tile
+  for (const QJsonValue &v : items) {
+    const QJsonObject it = v.toObject();
+    const QString qt = jstr(it, "quoteType");
+    if (!qt.isEmpty() && qt.compare(QLatin1String(HM_EQUITY_TYPE), Qt::CaseInsensitive) != 0)
+      continue;
+    const bool all = c.kind == HmClusterAll;  // no OTC / size filter
+    if (!all &&
+        jstr(it, "exchange").contains(QLatin1String(HM_OTC_MARK), Qt::CaseInsensitive))
+      continue;
+    double cap = 0;
+    const bool hasCap = jnum(it.value("marketCap"), cap) && cap > 0;
+    if (!all && (!hasCap || cap < c.minCap)) continue;
+    HmTile t;
+    t.sym = jstr(it, "ticker").trimmed().toUpper();
+    if (t.sym.isEmpty()) continue;
+    t.name = jstr(it, "name");
+    if (hasCap) {
+      t.cap = cap;
+      t.hasCap = true;
+    }
+    const QString industry = jstr(it, "industry").trimmed();
+    switch (c.kind) {
+    case HmClusterIndustry:
+      if (!inds.contains(industry.toLower())) continue;
+      t.sector = industry.toUpper();
+      t.group = hmCapBand(cap);
+      break;
+    case HmClusterForeign: {
+      const QString country = jstr(it, "country").trimmed();
+      if (country.isEmpty() || country == QLatin1String(HM_HOME_COUNTRY)) continue;
+      QString unusedGroup;
+      hmClassify(jstr(it, "sector"), industry, jstr(it, "sp500Sector"), t.group,
+                 unusedGroup);
+      t.sector = country.toUpper();
+      break;
+    }
+    default:
+      hmClassify(jstr(it, "sector"), industry, jstr(it, "sp500Sector"), t.sector,
+                 t.group);
+      break;
+    }
+    QString company = jstr(it, "cik").trimmed();
+    if (company.isEmpty()) company = t.name.trimmed().toLower();
+    const auto dup = company.isEmpty() ? byCompany.constEnd() : byCompany.constFind(company);
+    if (dup != byCompany.constEnd()) {
+      if (hmBetterListing(t.sym, tiles[dup.value()].sym)) tiles[dup.value()] = t;
+      continue;
+    }
+    if (!company.isEmpty()) byCompany.insert(company, tiles.size());
+    tiles << t;
+  }
+  if (c.kind != HmClusterAll && tiles.size() > HM_CLUSTER_MAX_TILES) {
+    std::stable_sort(tiles.begin(), tiles.end(),
+                     [](const HmTile &a, const HmTile &b) { return a.cap > b.cap; });
+    tiles.resize(HM_CLUSTER_MAX_TILES);
+  }
+  return tiles;
+}
+#endif
+
 // The treemap itself. Layout coordinates equal widget pixels at zoom 1; the
 // view transform (m_scale, m_off) maps them to the screen, so zooming keeps
 // the layout and only re-renders (labels appear as tiles grow).
@@ -2247,6 +2545,11 @@ public:
     setAttribute(Qt::WA_OpaquePaintEvent);
     m_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
     m_font.setBold(true);
+#ifdef HEATMAP_ZOOM_ANIMATION
+    m_animTimer = new QTimer(this);
+    m_animTimer->setInterval(HM_ZOOM_ANIM_TICK_MS);
+    QObject::connect(m_animTimer, &QTimer::timeout, this, [this]() { animTick(); });
+#endif
   }
 
   void setTiles(const QVector<HmTile> &tiles) {
@@ -2254,6 +2557,9 @@ public:
     m_index.clear();
     for (int i = 0; i < m_tiles.size(); ++i) m_index.insert(m_tiles[i].sym, i);
     m_hover = -1;
+#ifdef HEATMAP_SECTION_ZOOM
+    m_zoomSec = m_zoomGrp = -1;  // sectors / groups may differ after a reload
+#endif
     regroup();
     relayout();
   }
@@ -2310,10 +2616,33 @@ public:
   }
 
   void fit() {
+#ifdef HEATMAP_ZOOM_ANIMATION
+    stopAnim();
+#endif
+#ifdef HEATMAP_SECTION_ZOOM
+    m_zoomSec = m_zoomGrp = -1;
+#endif
     m_scale = 1;
     m_off = QPointF();
     update();
   }
+
+#ifdef HEATMAP_ZOOM_ANIMATION
+  // fit() with a zoom transition.
+  void fitAnimated() {
+    m_zoomSec = m_zoomGrp = -1;
+    animateTo(1.0, QPointF());
+  }
+#endif
+
+#ifdef HEATMAP_SECTION_ZOOM
+  bool isZoomed() const {
+#ifdef HEATMAP_ZOOM_ANIMATION
+    if (m_animating) return m_animS1 > 1.0 + HM_ZOOM_EPS;  // where it is heading
+#endif
+    return m_scale > 1.0 + HM_ZOOM_EPS;
+  }
+#endif
 
   void zoomBy(double factor) { zoomAt(QPointF(width() / 2.0, height() / 2.0), factor); }
 
@@ -2360,6 +2689,22 @@ public:
         for (int k = 0; k < grp.tiles.size(); ++k) m_tiles[grp.tiles[k]].r = tr[k];
       }
     }
+#ifdef HEATMAP_SECTION_ZOOM
+    // Keep a zoomed sector / group filling the view while quotes re-size it.
+    const QRectF zr = zoomTargetRect();
+#ifdef HEATMAP_ZOOM_ANIMATION
+    if (m_animating) {  // retarget a running transition, don't jump
+      if (!zr.isEmpty()) targetForRect(zr, m_animS1, m_animOff1);
+      else clampTarget(m_animS1, m_animOff1);
+      update();
+      return;
+    }
+#endif
+    if (!zr.isEmpty()) {
+      zoomToRect(zr);
+      return;
+    }
+#endif
     clampView();
     update();
   }
@@ -2407,6 +2752,12 @@ protected:
     // scrolling pans, with Ctrl / Cmd it zooms. Mouse wheels always zoom.
     const QPoint px = e->pixelDelta();
     if (!px.isNull() && !(e->modifiers() & Qt::ControlModifier)) {
+#ifdef HEATMAP_ZOOM_ANIMATION
+      stopAnim();
+#endif
+#ifdef HEATMAP_SECTION_ZOOM
+      m_zoomSec = m_zoomGrp = -1;
+#endif
       m_off += QPointF(px);
       clampView();
       update();
@@ -2434,7 +2785,11 @@ protected:
         return true;
       }
       if (g->gestureType() == Qt::SmartZoomNativeGesture) {
+#ifdef HEATMAP_ZOOM_ANIMATION
+        fitAnimated();
+#else
         fit();
+#endif
         return true;
       }
     }
@@ -2459,6 +2814,15 @@ protected:
         QToolTip::hideText();
       }
       if (m_dragMoved) {
+#ifdef HEATMAP_ZOOM_ANIMATION
+        if (m_animating) {  // grab the view where the transition is now
+          stopAnim();
+          m_pressOff = m_off - d;
+        }
+#endif
+#ifdef HEATMAP_SECTION_ZOOM
+        m_zoomSec = m_zoomGrp = -1;
+#endif
         m_off = m_pressOff + d;
         clampView();
         update();
@@ -2477,6 +2841,31 @@ protected:
 
   void mouseDoubleClickEvent(QMouseEvent *e) override {
     if (e->button() != Qt::LeftButton) return;
+#ifdef HEATMAP_SECTION_ZOOM
+    int hs = -1, hg = -1;
+    if (hitHeader(e->localPos(), hs, hg)) {
+      if (hs == m_zoomSec && hg == m_zoomGrp) {
+#ifdef HEATMAP_ZOOM_ANIMATION
+        fitAnimated();
+#else
+        fit();
+#endif
+      } else {
+        m_zoomSec = hs;
+        m_zoomGrp = hg;
+#ifdef HEATMAP_ZOOM_ANIMATION
+        double s = 1.0;
+        QPointF off;
+        targetForRect(zoomTargetRect(), s, off);
+        animateTo(s, off);
+#else
+        zoomToRect(zoomTargetRect());
+#endif
+      }
+      updateHover(e->localPos(), e->globalPos());
+      return;
+    }
+#endif
     const int i = hit(e->localPos());
     if (i >= 0 && onOpen) onOpen(m_tiles[i].sym);
   }
@@ -2556,12 +2945,149 @@ private:
   }
 
   void zoomAt(const QPointF &pos, double factor) {
+#ifdef HEATMAP_ZOOM_ANIMATION
+    stopAnim();
+#endif
+#ifdef HEATMAP_SECTION_ZOOM
+    m_zoomSec = m_zoomGrp = -1;
+#endif
     const QPointF anchor = toLayout(pos);
     m_scale = qBound(1.0, m_scale * factor, HM_ZOOM_MAX);
     m_off = pos - anchor * m_scale;
     clampView();
     update();
   }
+
+#ifdef HEATMAP_SECTION_ZOOM
+  // Layout rect of the zoomed sector (m_zoomGrp < 0) or group; empty if none.
+  QRectF zoomTargetRect() const {
+    if (m_zoomSec < 0 || m_zoomSec >= m_sectors.size()) return QRectF();
+    const HmSector &sec = m_sectors[m_zoomSec];
+    if (m_zoomGrp < 0) return sec.r;
+    if (m_zoomGrp >= sec.groups.size()) return QRectF();
+    return sec.groups[m_zoomGrp].r;
+  }
+
+  // Scales r (layout coords) to fit the view, centered.
+  void zoomToRect(const QRectF &r) {
+#ifdef HEATMAP_ZOOM_ANIMATION
+    stopAnim();
+#endif
+    if (r.width() <= 0 || r.height() <= 0 || width() <= 0 || height() <= 0) {
+      clampView();
+      update();
+      return;
+    }
+    m_scale = qBound(1.0, qMin(width() / r.width(), height() / r.height()),
+                     HM_ZOOM_MAX);
+    m_off = QPointF(width() / 2.0, height() / 2.0) - r.center() * m_scale;
+    clampView();
+    update();
+  }
+#endif
+
+#ifdef HEATMAP_ZOOM_ANIMATION
+  // clampView() for a (scale, offset) pair that is not applied yet.
+  void clampTarget(double &s, QPointF &off) const {
+    s = qBound(1.0, s, HM_ZOOM_MAX);
+    off.setX(qBound(width() - width() * s, off.x(), 0.0));
+    off.setY(qBound(height() - height() * s, off.y(), 0.0));
+  }
+
+  // The (clamped) view that zoomToRect(r) would produce.
+  void targetForRect(const QRectF &r, double &s, QPointF &off) const {
+    if (r.width() <= 0 || r.height() <= 0 || width() <= 0 || height() <= 0) {
+      s = m_scale;
+      off = m_off;
+    } else {
+      s = qMin(width() / r.width(), height() / r.height());
+      s = qBound(1.0, s, HM_ZOOM_MAX);
+      off = QPointF(width() / 2.0, height() / 2.0) - r.center() * s;
+    }
+    clampTarget(s, off);
+  }
+
+  // Glides from the current view to (s1, off1).
+  void animateTo(double s1, const QPointF &off1) {
+    m_animS0 = m_scale;
+    m_animOff0 = m_off;
+    m_animS1 = s1;
+    m_animOff1 = off1;
+    clampTarget(m_animS1, m_animOff1);
+    const bool same = std::fabs(m_animS1 - m_scale) < HM_ZOOM_ANIM_MIN_DS &&
+                      (m_animOff1 - m_off).manhattanLength() < HM_ZOOM_ANIM_MIN_PX;
+    if (same || !isVisible()) {
+      stopAnim();
+      m_scale = m_animS1;
+      m_off = m_animOff1;
+      clampView();
+      update();
+      return;
+    }
+    m_animating = true;
+    m_animClock.start();
+    m_animTimer->start();
+  }
+
+  void stopAnim() {
+    m_animating = false;
+    if (m_animTimer) m_animTimer->stop();
+  }
+
+  // One frame: eased progress, scale interpolated geometrically, zooming
+  // about the point that is fixed between the start and target views (so
+  // the motion is a pure zoom instead of a sliding pan).
+  void animTick() {
+    const double t = m_animClock.elapsed() / double(HM_ZOOM_ANIM_MS);
+    if (t >= 1.0) {
+      stopAnim();
+      m_scale = m_animS1;
+      m_off = m_animOff1;
+      clampView();
+      update();
+      return;
+    }
+    const double e = t < 0.5 ? 4.0 * t * t * t : 1.0 - std::pow(2.0 - 2.0 * t, 3) / 2.0;
+    const double s0 = m_animS0, s1 = m_animS1;
+    const double s = std::exp(std::log(s0) + (std::log(s1) - std::log(s0)) * e);
+    if (std::fabs(s1 - s0) >= HM_ZOOM_ANIM_MIN_DS) {
+      const QPointF fixedLayout = (m_animOff0 - m_animOff1) / (s1 - s0);
+      const QPointF fixedScreen = fixedLayout * s0 + m_animOff0;
+      m_off = fixedScreen - fixedLayout * s;
+    } else {
+      m_off = m_animOff0 + (m_animOff1 - m_animOff0) * e;
+    }
+    m_scale = s;
+    clampView();
+    update();
+  }
+#endif
+
+#ifdef HEATMAP_SECTION_ZOOM
+  // Sector header (g = -1) or group header under pos.
+  bool hitHeader(const QPointF &pos, int &s, int &g) const {
+    const QPointF p = toLayout(pos);
+    for (int si = 0; si < m_sectors.size(); ++si) {
+      const HmSector &sec = m_sectors[si];
+      if (!sec.r.contains(p)) continue;
+      if (!sec.hdr.isEmpty() && sec.hdr.contains(p)) {
+        s = si;
+        g = -1;
+        return true;
+      }
+      for (int gi = 0; gi < sec.groups.size(); ++gi) {
+        const HmGroup &grp = sec.groups[gi];
+        if (!grp.hdr.isEmpty() && grp.hdr.contains(p)) {
+          s = si;
+          g = gi;
+          return true;
+        }
+      }
+      return false;
+    }
+    return false;
+  }
+#endif
 
   int hit(const QPointF &pos) const {
     const QPointF p = toLayout(pos);
@@ -2577,6 +3103,21 @@ private:
       update();
     }
     if (i < 0) {
+#ifdef HEATMAP_SECTION_ZOOM
+      int hs = -1, hg = -1;
+      if (hitHeader(pos, hs, hg)) {
+        const bool zoomed = hs == m_zoomSec && hg == m_zoomGrp;
+        const QString name = hg < 0 ? m_sectors[hs].name
+                                    : m_sectors[hs].groups[hg].name;
+        QToolTip::showText(global,
+                           QString("<b>%1</b><br><i>%2</i>")
+                               .arg(name.toHtmlEscaped(),
+                                    zoomed ? QString("double-click / Esc: show all")
+                                           : QString("double-click to zoom in")),
+                           this);
+        return;
+      }
+#endif
       QToolTip::hideText();
       return;
     }
@@ -2666,6 +3207,17 @@ private:
   bool m_dragMoved = false;
   QPointF m_pressPos;
   QPointF m_pressOff;
+#ifdef HEATMAP_SECTION_ZOOM
+  int m_zoomSec = -1;  // header-zoomed sector, -1 = none
+  int m_zoomGrp = -1;  // header-zoomed group in m_zoomSec, -1 = whole sector
+#endif
+#ifdef HEATMAP_ZOOM_ANIMATION
+  QTimer *m_animTimer = nullptr;
+  QElapsedTimer m_animClock;
+  bool m_animating = false;
+  double m_animS0 = 1.0, m_animS1 = 1.0;  // start / target scale
+  QPointF m_animOff0, m_animOff1;         // start / target offset
+#endif
 };
 
 // Color scale of the map: -3 % .. +3 % in HM_LEGEND_STEPS boxes.
@@ -2703,6 +3255,9 @@ public:
   std::function<void()> onClose;
   std::function<void(const QString &)> onOpen;
   std::function<void()> onModeChanged;
+#ifdef HEATMAP_CLUSTERS
+  std::function<void()> onClusterChanged;
+#endif
 
   explicit HeatmapPage(Api *api) : m_api(api) {
     QVBoxLayout *v = new QVBoxLayout(this);
@@ -2714,9 +3269,25 @@ public:
     QHBoxLayout *h = new QHBoxLayout(bar);
     h->setContentsMargins(PANEL_PAD, PANEL_PAD, PANEL_PAD, PANEL_PAD);
     h->setSpacing(PANEL_SPACING);
+#ifdef HEATMAP_CLUSTERS
+    QLabel *title = new QLabel(HM_CLUSTER_TITLE);
+#else
     QLabel *title = new QLabel(HEATMAP_TITLE);
+#endif
     title->setObjectName("panelTitle");
     h->addWidget(title);
+#ifdef HEATMAP_CLUSTERS
+    m_clusterBox = new QComboBox;
+    for (int i = 0; i < HM_CLUSTER_COUNT; ++i) {
+      m_clusterBox->addItem(QString::fromLatin1(HM_CLUSTERS[i].label));
+      m_clusterBox->setItemData(i, hmClusterTooltip(HM_CLUSTERS[i]), Qt::ToolTipRole);
+    }
+    m_clusterBox->setMaxVisibleItems(HM_CLUSTER_COUNT);
+    m_clusterBox->setCurrentIndex(m_clusterIdx);
+    m_clusterBox->setToolTip("Which companies the map shows (S&P 500 or an industry cluster)");
+    onComboChanged(m_clusterBox, this, [this](int i) { pickCluster(i); });
+    h->addWidget(m_clusterBox);
+#endif
     QLabel *sizeLbl = new QLabel("SIZE");
     sizeLbl->setObjectName("panelStatus");
     h->addWidget(sizeLbl);
@@ -2756,21 +3327,50 @@ public:
 
     m_view = new HeatmapView;
     m_view->setToolTip(QString());
+#ifdef HEATMAP_SECTION_ZOOM
+    close->setToolTip("Back to the terminal (Esc; when zoomed, Esc first shows all)");
+    m_view->setMessage("Wheel / pinch: zoom   drag / two-finger scroll: pan   "
+                       "double-click: open ticker   double-click header: zoom "
+                       "section (again / Esc: show all)");
+#else
     m_view->setMessage("Wheel / pinch: zoom   drag / two-finger scroll: pan   "
                        "double-click: open ticker");
+#endif
     m_view->onOpen = [this](const QString &sym) {
       if (onOpen) onOpen(sym);
     };
     v->addWidget(m_view, 1);
 
+#ifdef HEATMAP_ZOOM_ANIMATION
+    QObject::connect(fit, &QPushButton::clicked, this, [this]() { m_view->fitAnimated(); });
+#else
     QObject::connect(fit, &QPushButton::clicked, this, [this]() { m_view->fit(); });
+#endif
+#ifdef HEATMAP_CLUSTERS
+    reload->setToolTip("Reload the members (ticker universe) and quotes");
+    QObject::connect(reload, &QPushButton::clicked, this, [this]() {
+      m_haveAll = false;  // re-fetch the universe too
+      load(true);
+    });
+#else
     QObject::connect(reload, &QPushButton::clicked, this, [this]() { load(true); });
+#endif
     QObject::connect(close, &QPushButton::clicked, this, [this]() {
       if (onClose) onClose();
     });
     QShortcut *esc = new QShortcut(QKeySequence(Qt::Key_Escape), this);
     esc->setContext(Qt::WidgetWithChildrenShortcut);
     QObject::connect(esc, &QShortcut::activated, this, [this]() {
+#ifdef HEATMAP_SECTION_ZOOM
+      if (m_view->isZoomed()) {  // first Esc: back to the whole map
+#ifdef HEATMAP_ZOOM_ANIMATION
+        m_view->fitAnimated();
+#else
+        m_view->fit();
+#endif
+        return;
+      }
+#endif
       if (onClose) onClose();
     });
 
@@ -2801,7 +3401,92 @@ public:
     m_view->update();
   }
 
+#ifdef HEATMAP_CLUSTERS
+  QString clusterKey() const { return QString::fromLatin1(HM_CLUSTERS[m_clusterIdx].key); }
+  // Restores a saved cluster (unknown keys: S&P 500); reloads if already shown.
+  void setClusterKey(const QString &key) {
+    const int i = hmClusterIndex(key);
+    if (i == m_clusterIdx) return;
+    m_clusterIdx = i;
+    {
+      const QSignalBlocker block(m_clusterBox);
+      m_clusterBox->setCurrentIndex(i);
+    }
+    if (m_view->tileCount() > 0) {
+      m_view->fit();
+      load(true);
+    }
+  }
+#endif
+
 private:
+#ifdef HEATMAP_CLUSTERS
+  void pickCluster(int i) {
+    if (i < 0 || i >= HM_CLUSTER_COUNT || i == m_clusterIdx) return;
+    m_clusterIdx = i;
+    m_view->fit();
+    load(true);
+    m_view->setFocus();
+    if (onClusterChanged) onClusterChanged();
+  }
+
+  // Non-S&P clusters: the whole classified universe, fetched once and kept
+  // for HM_UNIVERSE_CACHE_MS (RELOAD re-fetches it).
+  void fetchCluster(int seq) {
+    if (m_haveAll && m_allAge.isValid() && m_allAge.elapsed() < HM_UNIVERSE_CACHE_MS) {
+      applyCluster(seq);
+      return;
+    }
+    setPanelBusy(m_status, "Loading ticker universe\xe2\x80\xa6");
+    QUrlQuery q;
+    q.addQueryItem("index", "all");
+    q.addQueryItem("classified", "1");
+    q.addQueryItem("limit", QString::number(HM_ALL_UNIVERSE_LIMIT));
+    m_api->getJson(ROUTE_UNIVERSE, q,
+                   [this, seq](int st, const QJsonObject &o, const QString &err) {
+      if (seq != m_seq) return;
+      const QString e = bodyError(st, o, err);
+      if (!e.isEmpty()) {
+        clearForeignTiles("Ticker universe unavailable: " + e);
+        fail(e);
+        return;
+      }
+      m_allItems = o.value("items").toArray();
+      m_haveAll = true;
+      m_allAge.start();
+      applyCluster(seq);
+    });
+  }
+
+  void applyCluster(int seq) {
+    const HmCluster &c = HM_CLUSTERS[m_clusterIdx];
+    const QVector<HmTile> tiles = hmClusterTiles(m_allItems, c);
+    if (tiles.isEmpty()) {
+      const QString msg =
+          QString("No %1 companies with a sector profile yet: the backend fetches "
+                  "Yahoo profiles in the background (progress in the status bar).")
+              .arg(QString::fromLatin1(c.label));
+      m_view->setTiles(tiles);
+      m_view->setMessage(msg);
+      m_shownCluster = m_clusterIdx;
+      fail(msg);
+      return;
+    }
+    m_view->setTiles(tiles);
+    m_shownCluster = m_clusterIdx;
+    fetchQuotes(seq);
+  }
+
+  // A member list failed: the map must not keep showing another cluster's
+  // tiles under the selected cluster's name.
+  void clearForeignTiles(const QString &msg) {
+    if (m_view->tileCount() > 0 && m_shownCluster == m_clusterIdx) return;
+    m_view->setTiles(QVector<HmTile>());
+    m_view->setMessage(msg);
+    m_shownCluster = m_clusterIdx;
+  }
+#endif
+
   void pickMode(HeatmapView::SizeMode m) {
     setSizeMode(m);
     if (onModeChanged) onModeChanged();
@@ -2836,6 +3521,12 @@ private:
   }
 
   void fetchMembers(int seq) {
+#ifdef HEATMAP_CLUSTERS
+    if (HM_CLUSTERS[m_clusterIdx].kind != HmClusterSp500) {
+      fetchCluster(seq);
+      return;
+    }
+#endif
     setPanelBusy(m_status, "Loading S&P 500 members\xe2\x80\xa6");
     QUrlQuery q;
     q.addQueryItem("index", "sp500");
@@ -2845,6 +3536,9 @@ private:
       if (seq != m_seq) return;
       const QString e = bodyError(st, o, err);
       if (!e.isEmpty()) {
+#ifdef HEATMAP_CLUSTERS
+        clearForeignTiles("S&P 500 members unavailable: " + e);
+#endif
         if (m_view->tileCount() == 0) m_view->setMessage("S&P 500 members unavailable: " + e);
         fail(e);
         return;
@@ -2872,11 +3566,17 @@ private:
         if (msg.isEmpty())
           msg = "No S&P 500 member list yet: the backend fetches it with "
                 "`ref sp500` (iShares IVV holdings, Wikipedia fallback).";
+#ifdef HEATMAP_CLUSTERS
+        clearForeignTiles(msg);
+#endif
         m_view->setMessage(msg);
         fail(msg);
         return;
       }
       m_view->setTiles(tiles);
+#ifdef HEATMAP_CLUSTERS
+      m_shownCluster = m_clusterIdx;
+#endif
       fetchQuotes(seq);
     });
   }
@@ -2958,6 +3658,14 @@ private:
   int m_qGot = 0;
   int m_qFailed = 0;
   QString m_qLastErr;
+#ifdef HEATMAP_CLUSTERS
+  QComboBox *m_clusterBox = nullptr;
+  int m_clusterIdx = HM_CLUSTER_DEFAULT;
+  int m_shownCluster = -1;  // cluster of the tiles on the map
+  QJsonArray m_allItems;  // cached GET /api/v2/universe?index=all items
+  bool m_haveAll = false;
+  QElapsedTimer m_allAge;
+#endif
 };
 #endif
 
@@ -3213,6 +3921,10 @@ private:
       loadSymbol(sym);
     };
     m_heatmap->onModeChanged = [this]() { saveSettingsDebounced(); };
+#ifdef HEATMAP_CLUSTERS
+    m_heatmap->setClusterKey(m_hmSavedCluster);
+    m_heatmap->onClusterChanged = [this]() { saveSettingsDebounced(); };
+#endif
     m_heatStack->addWidget(m_heatmap);
     return m_heatStack;
   }
@@ -6358,6 +7070,9 @@ private:
           m_heatmap->sizeMode() == HeatmapView::SizeMove ? HM_SIZE_MOVE_KEY
                                                          : HM_SIZE_CAP_KEY);
 #endif
+#ifdef HEATMAP_CLUSTERS
+    if (m_heatmap) o[SETTINGS_HEATMAP_CLUSTER_KEY] = m_heatmap->clusterKey();
+#endif
     o["geometry"] = QString::fromLatin1(saveGeometry().toBase64());
 
     const QString fn = settingsPath();
@@ -6396,6 +7111,9 @@ private:
     m_hmSavedMode = jstr(o, SETTINGS_HEATMAP_SIZE_KEY) == QLatin1String(HM_SIZE_MOVE_KEY)
                         ? HeatmapView::SizeMove
                         : HeatmapView::SizeCap;
+#endif
+#ifdef HEATMAP_CLUSTERS
+    m_hmSavedCluster = jstr(o, SETTINGS_HEATMAP_CLUSTER_KEY);
 #endif
     m_savedGeometry =
         QByteArray::fromBase64(jstr(o, "geometry").toLatin1());
@@ -6577,6 +7295,9 @@ private:
   HeatmapPage *m_heatmap = nullptr;
   QPushButton *m_heatmapBtn = nullptr;
   HeatmapView::SizeMode m_hmSavedMode = HeatmapView::SizeCap;
+#endif
+#ifdef HEATMAP_CLUSTERS
+  QString m_hmSavedCluster;  // settings key of the heatmap cluster
 #endif
 };
 
